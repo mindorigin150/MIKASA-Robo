@@ -843,7 +843,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = True
     """whether to save model into the `checkpoints/ppo_memtasks/runs/{run_name}/{TIME}` folder"""
@@ -857,7 +857,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "ShellGamePush-v1"
     """the id of the environment"""
-    include_state: bool = False
+    include_state: bool = True
     """whether to include state information in observations"""
     total_timesteps: int = 50_000_000
     """total timesteps of the experiments"""
@@ -1207,13 +1207,6 @@ if __name__ == "__main__":
             setattr(args, param_name, param_value)
 
     args.wandb_project_name = "MIKASA-Robo-dataset-collectors"
-    args.seed = 123
-    args.include_state = True
-    args.track = True
-    args.capture_video = True
-    args.save_model = True
-    args.total_timesteps = 150_000_000
-
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
