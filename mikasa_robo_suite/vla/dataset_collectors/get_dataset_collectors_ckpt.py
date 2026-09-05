@@ -851,6 +851,12 @@ class Args:
     """if toggled, only runs evaluation with the given model checkpoint and saves the evaluation trajectories"""
     checkpoint: Optional[str] = None
     """path to a pretrained checkpoint file to start evaluation/training from"""
+    latency_config: Optional[str] = None
+    """latency-bench command transport config for training and evaluation"""
+    resume: Optional[str] = None
+    """latency training bundle, including optimizer and progress"""
+    latency_output_dir: Optional[str] = None
+    """explicit output directory for the latency run"""
     render_mode: str = "all"
     """the environment rendering mode"""
 
@@ -1204,6 +1210,13 @@ if __name__ == "__main__":
 
     for param_name, param_value in env_params.items():
         if hasattr(args, param_name):
+            setattr(args, param_name, param_value)
+
+    if args.latency_config is not None:
+        from latency_bench.core.config import load_config
+
+        latency_config = load_config(args.latency_config)
+        for param_name, param_value in latency_config["training"].items():
             setattr(args, param_name, param_value)
 
     args.wandb_project_name = "MIKASA-Robo-dataset-collectors"
@@ -1636,6 +1649,19 @@ if __name__ == "__main__":
     eval_envs = ManiSkillVectorEnv(
         eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True
     )
+    if args.latency_config is not None:
+        # latency_bench is optional for the standalone upstream trainer.
+        from training.common.checkpoints import atomic_torch_save, capture_rng_state, restore_rng_state
+        from training.common.command_latency import TorchCommandLatencyWrapper
+
+        envs = TorchCommandLatencyWrapper(
+            envs, latency_config, num_envs=args.num_envs, device=device,
+            noop_command=latency_config["env"]["noop_action"],
+        )
+        eval_envs = TorchCommandLatencyWrapper(
+            eval_envs, latency_config, num_envs=args.num_eval_envs, device=device,
+            noop_command=latency_config["env"]["noop_action"],
+        )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
@@ -1686,6 +1712,7 @@ if __name__ == "__main__":
     obs = DictArray((args.num_steps, args.num_envs), envs.single_observation_space, device=device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    command_admitted = torch.ones((args.num_steps, args.num_envs), dtype=torch.bool, device=device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -1718,6 +1745,33 @@ if __name__ == "__main__":
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
 
+    start_iteration = 1
+    if args.resume is not None:
+        saved = torch.load(args.resume, map_location=device, weights_only=False)
+        agent.load_state_dict(saved["policy"])
+        optimizer.load_state_dict(saved["optimizer"])
+        global_step = saved["global_step"]
+        start_iteration = saved["iteration"] + 1
+        envs.latency.load_state_dict(saved["latency"])
+        restore_rng_state(saved)
+
+    def save_latency_checkpoint(completed_iteration):
+        if args.latency_config is None:
+            return
+        os.makedirs(args.latency_output_dir, exist_ok=True)
+        checkpoint = {
+            "policy": agent.state_dict(), "optimizer": optimizer.state_dict(),
+            "iteration": completed_iteration, "global_step": global_step,
+            "latency": envs.latency.state_dict(), "config": latency_config,
+            "args": asdict(args),
+            **capture_rng_state(),
+        }
+        # The resume bundle is authoritative; each completed file is replaced
+        # atomically so a failed write cannot truncate the preceding checkpoint.
+        for filename, payload in (("training.pt", checkpoint), ("teacher.pt", checkpoint["policy"])):
+            path = os.path.join(args.latency_output_dir, filename)
+            atomic_torch_save(payload, path)
+
     delayed_early_stop_env_ids = {
         "RememberColor3-VLA-v0",
         "RememberColor5-VLA-v0",
@@ -1748,7 +1802,7 @@ if __name__ == "__main__":
     }
     post_threshold_evals_remaining = None
 
-    for iteration in tqdm(range(1, args.num_iterations + 1), total=args.num_iterations, desc="Training"):
+    for iteration in tqdm(range(start_iteration, args.num_iterations + 1), total=args.num_iterations, desc="Training"):
         print(f"Epoch: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
@@ -1812,6 +1866,7 @@ if __name__ == "__main__":
 
                     if should_stop:
                         print(stop_message)
+                        save_latency_checkpoint(iteration - 1)
                         # Save final checkpoint
                         if args.save_model:
                             model_path = f"{SAVE_DIR}/{run_name}/{TIME}/final_success_ckpt.pt"
@@ -1856,6 +1911,8 @@ if __name__ == "__main__":
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action)
+            if args.latency_config is not None:
+                command_admitted[step] = infos["command_admitted"]
             next_done = torch.logical_or(terminations, truncations).to(torch.float32)
             rewards[step] = reward.view(-1) * args.reward_scale
 
@@ -1924,13 +1981,19 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
+        b_inds = torch.nonzero(command_admitted.flatten()).flatten().cpu().numpy()
+        logger.add_scalar("charts/admitted_commands", len(b_inds), global_step)
+        # A busy worker can reject an entire rollout. There is no new policy
+        # decision to optimize in that rollout, but its simulator time is real.
+        if len(b_inds) == 0:
+            save_latency_checkpoint(iteration)
+            continue
         agent.train()
-        b_inds = np.arange(args.batch_size)
         clipfracs = []
         update_time = time.time()
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            for start in range(0, len(b_inds), args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
@@ -1949,7 +2012,9 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std(unbiased=mb_advantages.numel() > 1) + 1e-8
+                    )
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -2004,6 +2069,7 @@ if __name__ == "__main__":
         logger.add_scalar("time/rollout_time", rollout_time, global_step)
         logger.add_scalar("time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step)
         del mb_advantages, newvalue, ratio, logratio
+        save_latency_checkpoint(iteration)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
