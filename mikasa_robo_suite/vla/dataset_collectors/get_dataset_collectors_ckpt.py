@@ -1724,8 +1724,6 @@ if __name__ == "__main__":
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     next_done = torch.zeros(args.num_envs, device=device)
     eps_returns = torch.zeros(args.num_envs, dtype=torch.float, device=device)
-    video_iteration = 0
-
     print("\n####")
     print(
         f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}"
@@ -1808,6 +1806,11 @@ if __name__ == "__main__":
         agent.eval()
         if iteration % args.eval_freq == 1:
             print("Evaluating")
+            if args.save_model:
+                torch.save(
+                    agent.state_dict(),
+                    f"{SAVE_DIR}/{run_name}/{TIME}/ckpt_{iteration - 1}.pt",
+                )
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
             num_episodes = 0
@@ -1883,12 +1886,6 @@ if __name__ == "__main__":
 
             if args.evaluate:
                 break
-
-        # if args.save_model and iteration % args.eval_freq == 1:
-        #     model_path = f"{SAVE_DIR}/{run_name}/{TIME}/ckpt_{video_iteration}_{iteration}.pt"
-        #     video_iteration += 1
-        #     torch.save(agent.state_dict(), model_path)
-        #     print(f"model saved to {model_path}")
 
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
