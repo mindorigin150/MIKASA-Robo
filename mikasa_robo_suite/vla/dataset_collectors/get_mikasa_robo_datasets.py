@@ -489,10 +489,10 @@ def collect_batched_data_from_ckpt(
     transport = None
     if latency_config is not None:
         from latency_bench.core.config import load_config
-        from training.common.command_latency import CommandLatencyBatch
+        from training.common.action_latency import ActionLatencyBatch
 
         config = load_config(latency_config)
-        transport = CommandLatencyBatch(
+        transport = ActionLatencyBatch(
             config, num_envs=batch_size, device=device,
             noop_command=config["env"]["noop_action"],
         )

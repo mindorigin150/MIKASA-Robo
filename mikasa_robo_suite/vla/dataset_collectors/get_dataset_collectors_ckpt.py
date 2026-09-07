@@ -684,6 +684,7 @@ def get_env_config(env_id):
     raise ValueError(f"Environment {env_id} not found in ENVS_CONFIG")
 
 
+import json
 import os
 import random
 import time
@@ -1652,13 +1653,13 @@ if __name__ == "__main__":
     if args.latency_config is not None:
         # latency_bench is optional for the standalone upstream trainer.
         from training.common.checkpoints import atomic_torch_save, capture_rng_state, restore_rng_state
-        from training.common.command_latency import TorchCommandLatencyWrapper
+        from training.common.action_latency import TorchActionLatencyWrapper
 
-        envs = TorchCommandLatencyWrapper(
+        envs = TorchActionLatencyWrapper(
             envs, latency_config, num_envs=args.num_envs, device=device,
             noop_command=latency_config["env"]["noop_action"],
         )
-        eval_envs = TorchCommandLatencyWrapper(
+        eval_envs = TorchActionLatencyWrapper(
             eval_envs, latency_config, num_envs=args.num_eval_envs, device=device,
             noop_command=latency_config["env"]["noop_action"],
         )
@@ -1804,7 +1805,7 @@ if __name__ == "__main__":
         print(f"Epoch: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
-        if iteration % args.eval_freq == 1:
+        if (iteration - 1) % args.eval_freq == 0:
             print("Evaluating")
             if args.save_model:
                 torch.save(
@@ -1814,11 +1815,16 @@ if __name__ == "__main__":
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
             num_episodes = 0
+            eval_start = time.perf_counter()
+            admitted_count = dropped_count = 0
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
                     eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(
                         agent.get_action(eval_obs, deterministic=True)
                     )
+                    if args.latency_config is not None:
+                        admitted_count += eval_infos["command_admitted"].sum().item()
+                        dropped_count += eval_infos["command_dropped"].sum().item()
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -1836,7 +1842,7 @@ if __name__ == "__main__":
                 # !!!!!!!!!!!!!!!!
 
                 # Check if success_once reached threshold and stop training.
-                if k == "success_once":
+                if k == "success_once" and args.latency_config is None:
                     should_stop = False
                     stop_message = None
 
@@ -1885,6 +1891,20 @@ if __name__ == "__main__":
                 # !!!!!!!!!!!!!!!!
 
             if args.evaluate:
+                if args.latency_config is not None:
+                    elapsed = time.perf_counter() - eval_start
+                    os.makedirs(args.latency_output_dir, exist_ok=True)
+                    with open(os.path.join(args.latency_output_dir, "evaluation.json"), "w") as f:
+                        json.dump({
+                            "checkpoint": args.checkpoint,
+                            "config": latency_config,
+                            "episodes": num_episodes.item(),
+                            "metrics": {k: torch.stack(v).float().mean().item() for k, v in eval_metrics.items()},
+                            "admitted_count": admitted_count,
+                            "dropped_count": dropped_count,
+                            "elapsed_seconds": elapsed,
+                            "raw_frames_per_second": args.num_eval_steps * args.num_eval_envs / elapsed,
+                        }, f, indent=2)
                 break
 
         # Annealing the rate if instructed to do so.
@@ -2076,5 +2096,6 @@ if __name__ == "__main__":
         print(f"model saved to {model_path}")
 
     envs.close()
+    eval_envs.close()
     if logger is not None:
         logger.close()
