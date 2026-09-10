@@ -1201,6 +1201,39 @@ class Logger:
         self.writer.close()
 
 
+def ppo_losses(args, newlogprob, entropy, newvalue, logprobs, advantages, returns, values, admitted):
+    """Fit values on every control step and policy terms on admitted commands."""
+    newvalue = newvalue.view(-1)
+    if args.clip_vloss:
+        v_clipped = values + torch.clamp(newvalue - values, -args.clip_coef, args.clip_coef)
+        v_loss = 0.5 * torch.maximum((newvalue - returns) ** 2, (v_clipped - returns) ** 2).mean()
+    else:
+        v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
+
+    # A worker may be busy for the whole minibatch; those states still train
+    # the critic, while no policy decision contributes an actor gradient.
+    if not admitted.any():
+        zero = newvalue.new_zeros(())
+        return zero, v_loss, zero, zero, zero, zero
+
+    logratio = newlogprob[admitted] - logprobs[admitted]
+    ratio = logratio.exp()
+    advantages = advantages[admitted]
+    if args.norm_adv:
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=advantages.numel() > 1) + 1e-8
+        )
+    pg_loss = torch.maximum(
+        -advantages * ratio,
+        -advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef),
+    ).mean()
+    with torch.no_grad():
+        old_approx_kl = (-logratio).mean()
+        approx_kl = ((ratio - 1) - logratio).mean()
+        clipfrac = ((ratio - 1).abs() > args.clip_coef).float().mean()
+    return pg_loss, v_loss, entropy[admitted].mean(), old_approx_kl, approx_kl, clipfrac
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -1675,7 +1708,12 @@ if __name__ == "__main__":
         if args.track:
             import wandb
 
-            config = vars(args)
+            config = asdict(args)
+            if args.latency_config is not None:
+                config["latency_config_resolved"] = latency_config
+                if latency_config["latency"]["method"] in ("iid", "temporal"):
+                    with open(latency_config["latency"]["profile_path"]) as stream:
+                        config["latency_profile"] = json.load(stream)
             config["env_cfg"] = dict(
                 **env_kwargs,
                 num_envs=args.num_envs,
@@ -1745,12 +1783,14 @@ if __name__ == "__main__":
         agent.load_state_dict(torch.load(args.checkpoint))
 
     start_iteration = 1
+    best_success_at_end = -1.0
     if args.resume is not None:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         agent.load_state_dict(saved["policy"])
         optimizer.load_state_dict(saved["optimizer"])
         global_step = saved["global_step"]
         start_iteration = saved["iteration"] + 1
+        best_success_at_end = saved["best_success_at_end"]
         envs.latency.load_state_dict(saved["latency"])
         restore_rng_state(saved)
 
@@ -1761,6 +1801,7 @@ if __name__ == "__main__":
         checkpoint = {
             "policy": agent.state_dict(), "optimizer": optimizer.state_dict(),
             "iteration": completed_iteration, "global_step": global_step,
+            "best_success_at_end": best_success_at_end,
             "latency": envs.latency.state_dict(), "config": latency_config,
             "args": asdict(args),
             **capture_rng_state(),
@@ -1807,7 +1848,7 @@ if __name__ == "__main__":
         agent.eval()
         if (iteration - 1) % args.eval_freq == 0:
             print("Evaluating")
-            if args.save_model:
+            if args.save_model and not args.evaluate:
                 torch.save(
                     agent.state_dict(),
                     f"{SAVE_DIR}/{run_name}/{TIME}/ckpt_{iteration - 1}.pt",
@@ -1831,6 +1872,22 @@ if __name__ == "__main__":
                         for k, v in eval_infos["final_info"]["episode"].items():
                             eval_metrics[k].append(v)
             print(f"Evaluated {args.num_eval_steps * args.num_eval_envs} steps resulting in {num_episodes} episodes")
+            if args.latency_config is not None and not args.evaluate:
+                logger.add_scalar("eval/admitted_commands", admitted_count, global_step)
+                logger.add_scalar("eval/dropped_commands", dropped_count, global_step)
+                score = torch.cat(eval_metrics["success_at_end"]).float().mean().item()
+                if score > best_success_at_end:
+                    best_success_at_end = score
+                    os.makedirs(args.latency_output_dir, exist_ok=True)
+                    atomic_torch_save(agent.state_dict(), os.path.join(args.latency_output_dir, "best_policy.pt"))
+                    with open(os.path.join(args.latency_output_dir, "best_evaluation.json"), "w") as stream:
+                        json.dump({
+                            "global_step": global_step,
+                            "checkpoint_iteration": iteration - 1,
+                            "episodes": num_episodes.item(),
+                            "metrics": {k: torch.cat(v).float().mean().item() for k, v in eval_metrics.items()},
+                        }, stream, indent=2)
+                logger.add_scalar("eval/best_success_at_end", best_success_at_end, global_step)
             for k, v in eval_metrics.items():
                 mean = torch.stack(v).float().mean()
                 if logger is not None:
@@ -1998,15 +2055,12 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = torch.nonzero(command_admitted.flatten()).flatten().cpu().numpy()
-        logger.add_scalar("charts/admitted_commands", len(b_inds), global_step)
-        # A busy worker can reject an entire rollout. There is no new policy
-        # decision to optimize in that rollout, but its simulator time is real.
-        if len(b_inds) == 0:
-            save_latency_checkpoint(iteration)
-            continue
+        b_admitted = command_admitted.flatten()
+        b_inds = np.arange(args.batch_size)
+        logger.add_scalar("charts/admitted_commands", b_admitted.sum().item(), global_step)
+        logger.add_scalar("charts/admission_rate", b_admitted.float().mean().item(), global_step)
         agent.train()
-        clipfracs = []
+        actor_updates = 0
         update_time = time.time()
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
@@ -2015,46 +2069,14 @@ if __name__ == "__main__":
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
+                pg_loss, v_loss, entropy_loss, old_approx_kl, approx_kl, clipfrac = ppo_losses(
+                    args, newlogprob, entropy, newvalue, b_logprobs[mb_inds],
+                    b_advantages[mb_inds], b_returns[mb_inds], b_values[mb_inds], b_admitted[mb_inds],
+                )
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
-
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                        mb_advantages.std(unbiased=mb_advantages.numel() > 1) + 1e-8
-                    )
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                actor_updates += b_admitted[mb_inds].any().item()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -2065,6 +2087,15 @@ if __name__ == "__main__":
                 break
 
         update_time = time.time() - update_time
+
+        # Report the complete admitted rollout after the update; the last
+        # minibatch alone can hide a policy jump or contain no decisions.
+        with torch.no_grad():
+            _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs, b_actions)
+            pg_loss, v_loss, entropy_loss, old_approx_kl, approx_kl, clipfrac = ppo_losses(
+                args, newlogprob, entropy, newvalue, b_logprobs,
+                b_advantages, b_returns, b_values, b_admitted,
+            )
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -2077,7 +2108,8 @@ if __name__ == "__main__":
         logger.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         logger.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         logger.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        logger.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        logger.add_scalar("losses/clipfrac", clipfrac.item(), global_step)
+        logger.add_scalar("charts/actor_updates", actor_updates, global_step)
         logger.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         logger.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
@@ -2085,7 +2117,7 @@ if __name__ == "__main__":
         logger.add_scalar("time/update_time", update_time, global_step)
         logger.add_scalar("time/rollout_time", rollout_time, global_step)
         logger.add_scalar("time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step)
-        del mb_advantages, newvalue, ratio, logratio
+        del newlogprob, entropy, newvalue
         save_latency_checkpoint(iteration)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
