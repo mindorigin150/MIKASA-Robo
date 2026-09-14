@@ -840,7 +840,7 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ManiSkill-MemoryBench"
+    wandb_project_name: str = "MIKASA-Robo-dataset-collectors"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -1253,7 +1253,6 @@ if __name__ == "__main__":
         for param_name, param_value in latency_config["training"].items():
             setattr(args, param_name, param_value)
 
-    args.wandb_project_name = "MIKASA-Robo-dataset-collectors"
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
