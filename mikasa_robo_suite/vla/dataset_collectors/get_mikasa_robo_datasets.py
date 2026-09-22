@@ -18,6 +18,7 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 import mikasa_robo_suite.vla.memory_envs  # noqa: F401
 from baselines.ppo.ppo_memtasks import AgentStateOnly, FlattenRGBDObservationWrapper
+from mikasa_robo_suite.seed_reset import reset_seeded_slots
 from mikasa_robo_suite.vla.utils.dataset_naming import env_id_to_dataset_name
 from mikasa_robo_suite.vla.utils.wrappers import *
 
@@ -520,8 +521,8 @@ def collect_batched_data_from_ckpt(
         seeds = [attempted_batches * batch_size + i for i in range(batch_size)]
         attempted_batches += 1
 
-        obs_state, _ = env_state.reset(seed=seeds)
-        obs_rgb, _ = env_rgb.reset(seed=seeds)
+        obs_state = reset_seeded_slots(env_state, seeds)
+        obs_rgb = reset_seeded_slots(env_rgb, seeds)
         if transport is not None:
             transport.reset()
 

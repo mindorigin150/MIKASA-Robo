@@ -95,9 +95,11 @@ class InterceptGrabVLABaseEnv(BaseEnv):
         )
 
         self.reached_status = torch.zeros(self.num_envs, dtype=torch.float32)
+        self.oracle_info = torch.zeros((self.num_envs, 3), dtype=torch.float32)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         self.reached_status = self.reached_status.to(self.device)
+        self.oracle_info = self.oracle_info.to(self.device)
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
@@ -117,7 +119,7 @@ class InterceptGrabVLABaseEnv(BaseEnv):
             initial_velocity[..., 1] = torch.rand((b,)) * (max_vel - min_vel) + min_vel
             self.ball.set_linear_velocity(initial_velocity)
 
-            self.oracle_info = initial_velocity
+            self.oracle_info[env_idx] = initial_velocity
 
             if self.robot_uids in ("panda", "panda_wristcam"):
                 qpos = np.array([0.0, 0, 0, -np.pi * 2 / 3, 0, np.pi * 2 / 3, np.pi / 4, 0.04, 0.04])
