@@ -8,6 +8,7 @@ import torch
 from mani_skill.agents.robots.panda.panda import Panda
 from mani_skill.agents.robots.panda.panda_wristcam import PandaWristCam
 from mani_skill.envs.sapien_env import BaseEnv
+from mani_skill.render import SAPIEN_RENDER_SYSTEM
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
@@ -55,6 +56,26 @@ class InterceptGrabVLABaseEnv(BaseEnv):
     def __init__(self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
+
+    def _after_reconfigure(self, options):
+        super()._after_reconfigure(options)
+        self._render_cuda_stream = None
+
+    def _get_obs_sensor_data(self, apply_texture_transforms: bool = True):
+        if self.gpu_sim_enabled and not self.scene.parallel_in_single_scene and SAPIEN_RENDER_SYSTEM == "3.0":
+            if self._render_cuda_stream is None:
+                # ManiSkill creates the batched camera groups on the first render update.
+                self.scene.update_render()
+                self._render_cuda_stream = torch.cuda.Stream(device=self.device)
+                self.scene.render_system_group.set_cuda_stream(self._render_cuda_stream.cuda_stream)
+            self._render_cuda_stream.wait_stream(torch.cuda.current_stream(self.device))
+        return super()._get_obs_sensor_data(apply_texture_transforms=apply_texture_transforms)
+
+    def capture_sensor_data(self):
+        super().capture_sensor_data()
+        if self._render_cuda_stream is not None:
+            # Observation kernels consume images only after CUDA/Vulkan capture completes.
+            torch.cuda.current_stream(self.device).wait_stream(self._render_cuda_stream)
 
     @property
     def _default_sim_config(self):
